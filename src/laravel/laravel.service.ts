@@ -13,8 +13,10 @@ export interface SettleTradeDto {
   tradeId: string;
   buyUserId: string;
   sellUserId: string;
-  exbtAmount: string;
-  usdtAmount: string;
+  exbtAmount: string;   // gross EXBT traded
+  usdtAmount: string;   // gross USDT traded
+  buyerFee: string;     // EXBT deducted from buyer's credit (charged to buyer)
+  sellerFee: string;    // USDT deducted from seller's credit (charged to seller)
 }
 
 export interface UnlockFundsDto {

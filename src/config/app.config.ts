@@ -19,5 +19,7 @@ export const appConfig = registerAs('app', () => ({
   trading: {
     pair: process.env.TRADING_PAIR ?? 'EXBT/USDT',
     orderbookDepth: parseInt(process.env.ORDERBOOK_DEPTH ?? '50', 10),
+    makerFeeRate: process.env.MAKER_FEE_RATE ?? '0.001',  // 0.1%
+    takerFeeRate: process.env.TAKER_FEE_RATE ?? '0.0015', // 0.15%
   },
 }));

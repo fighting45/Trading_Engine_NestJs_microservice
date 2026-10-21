@@ -29,6 +29,8 @@ export interface Trade {
   sellOrderId: string;
   buyUserId: string;
   sellUserId: string;
+  buyerFee: string;   // EXBT deducted from buyer's credit
+  sellerFee: string;  // USDT deducted from seller's credit
   executedAt: number;
 }
 

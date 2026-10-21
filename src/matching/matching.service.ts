@@ -1,4 +1,5 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { v4 as uuidv4 } from 'uuid';
 import { Decimal } from 'decimal.js';
 import type { Redis } from 'ioredis';
@@ -20,6 +21,8 @@ const CH_TICKER = (pair: string) => `ticker:${pair}`;
 @Injectable()
 export class MatchingService {
   private readonly logger = new Logger(MatchingService.name);
+  private readonly makerFeeRate: Decimal;
+  private readonly takerFeeRate: Decimal;
 
   // Per-pair promise chain — ensures one order is fully matched before the next
   // starts. Safe for single-instance; replace with Redis MULTI/EXEC for multi-instance.
@@ -29,7 +32,15 @@ export class MatchingService {
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly orderbook: OrderbookService,
     private readonly laravel: LaravelService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    this.makerFeeRate = new Decimal(
+      this.config.get<string>('app.trading.makerFeeRate')!,
+    );
+    this.takerFeeRate = new Decimal(
+      this.config.get<string>('app.trading.takerFeeRate')!,
+    );
+  }
 
   async match(incomingOrder: Order): Promise<MatchResult> {
     return this.withLock(incomingOrder.pair, () => this.doMatch(incomingOrder));
@@ -39,20 +50,17 @@ export class MatchingService {
 
   private async doMatch(order: Order): Promise<MatchResult> {
     const trades: Trade[] = [];
-
     let remaining = new Decimal(order.quantity).minus(order.filledQuantity);
 
     const restingOrders =
       order.side === 'buy'
         ? await this.orderbook.getMatchingAsks(
-            order.type === 'market' ? '0' : order.price,
+            order.type === 'market' ? '999999999' : order.price,
           )
         : await this.orderbook.getMatchingBids(
-            order.type === 'market' ? '999999999' : order.price,
+            order.type === 'market' ? '0' : order.price,
           );
 
-    // Sort: best price first, then time priority (getMatchingBids/Asks already
-    // returns in price order; within same price, sort by createdAt asc)
     const sorted = this.sortResting(restingOrders, order.side);
 
     for (const resting of sorted) {
@@ -63,18 +71,34 @@ export class MatchingService {
       );
       if (restingRemaining.lte(0)) continue;
 
-      const fillQty = Decimal.min(remaining, restingRemaining);
-      const tradePrice = resting.price; // maker price always wins
+      const fillQty   = Decimal.min(remaining, restingRemaining);
+      const tradePrice = new Decimal(resting.price); // maker price always wins
+      const grossUsdt  = fillQty.times(tradePrice);
+
+      // ── Fee calculation ──────────────────────────────────────────────────────
+      // Incoming order = taker. Resting order = maker.
+      // Buyer fee: charged in EXBT (deducted from EXBT the buyer receives).
+      // Seller fee: charged in USDT (deducted from USDT the seller receives).
+
+      const isBuyerTaker = order.side === 'buy';
+
+      const buyerFeeRate  = isBuyerTaker ? this.takerFeeRate : this.makerFeeRate;
+      const sellerFeeRate = isBuyerTaker ? this.makerFeeRate : this.takerFeeRate;
+
+      const buyerFee  = fillQty.times(buyerFeeRate);   // in EXBT
+      const sellerFee = grossUsdt.times(sellerFeeRate); // in USDT
 
       const trade: Trade = {
         id: uuidv4(),
         pair: order.pair,
-        price: tradePrice,
+        price: tradePrice.toFixed(8),
         quantity: fillQty.toFixed(8),
-        buyOrderId: order.side === 'buy' ? order.id : resting.id,
-        sellOrderId: order.side === 'sell' ? order.id : resting.id,
-        buyUserId: order.side === 'buy' ? order.userId : resting.userId,
-        sellUserId: order.side === 'sell' ? order.userId : resting.userId,
+        buyOrderId:  order.side === 'buy'  ? order.id  : resting.id,
+        sellOrderId: order.side === 'sell' ? order.id  : resting.id,
+        buyUserId:   order.side === 'buy'  ? order.userId  : resting.userId,
+        sellUserId:  order.side === 'sell' ? order.userId  : resting.userId,
+        buyerFee:  buyerFee.toFixed(8),
+        sellerFee: sellerFee.toFixed(8),
         executedAt: Date.now(),
       };
 
@@ -97,22 +121,23 @@ export class MatchingService {
         await this.orderbook.removeOrder(resting.id, resting.side, resting.userId);
       }
 
-      // Settle via Laravel — debit seller's EXBT, credit buyer's EXBT,
-      // debit buyer's USDT, credit seller's USDT
-      const usdtAmount = fillQty.times(new Decimal(tradePrice)).toFixed(8);
+      // Settle via Laravel (net amounts — Laravel applies fees from locked funds)
       await this.laravel.settleTrade({
-        tradeId: trade.id,
-        buyUserId: trade.buyUserId,
+        tradeId:   trade.id,
+        buyUserId:  trade.buyUserId,
         sellUserId: trade.sellUserId,
         exbtAmount: fillQty.toFixed(8),
-        usdtAmount,
+        usdtAmount: grossUsdt.toFixed(8),
+        buyerFee:   trade.buyerFee,
+        sellerFee:  trade.sellerFee,
       });
 
       remaining = remaining.minus(fillQty);
       trades.push(trade);
 
       this.logger.debug(
-        `Trade ${trade.id}: ${fillQty.toFixed(8)} EXBT @ ${tradePrice} USDT`,
+        `Trade ${trade.id}: ${fillQty.toFixed(8)} EXBT @ ${tradePrice.toFixed(8)} USDT` +
+        ` | buyerFee=${trade.buyerFee} EXBT sellerFee=${trade.sellerFee} USDT`,
       );
     }
 
@@ -134,7 +159,6 @@ export class MatchingService {
       status: finalStatus,
     };
 
-    // Publish events after all trades are settled
     if (trades.length) {
       await this.publishTradeEvents(trades, finalOrder);
     }
@@ -153,21 +177,19 @@ export class MatchingService {
 
     const pipeline = this.redis.pipeline();
 
-    // Update ticker last price
     pipeline.hset(TICKER_KEY(pair), {
       lastPrice: lastTrade.price,
-      lastQty: lastTrade.quantity,
+      lastQty:   lastTrade.quantity,
       updatedAt: Date.now().toString(),
     });
 
-    // Publish to channels (WebSocket gateway subscribes to these)
     for (const trade of trades) {
       pipeline.publish(CH_TRADES(pair), JSON.stringify(trade));
     }
-    pipeline.publish(CH_ORDERBOOK(pair), '1'); // signal: snapshot changed
+    pipeline.publish(CH_ORDERBOOK(pair), '1');
     pipeline.publish(CH_TICKER(pair), JSON.stringify({
       lastPrice: lastTrade.price,
-      lastQty: lastTrade.quantity,
+      lastQty:   lastTrade.quantity,
     }));
 
     await pipeline.exec();
