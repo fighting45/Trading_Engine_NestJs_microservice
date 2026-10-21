@@ -51,7 +51,6 @@ export class OrderbookService implements OnModuleInit {
     const bookKey = order.side === 'buy' ? this.bidsKey() : this.asksKey();
 
     const pipeline = this.redis.pipeline();
-
     pipeline.zadd(bookKey, score, order.id);
     pipeline.hset(this.orderKey(order.id), {
       id: order.id,
@@ -66,7 +65,6 @@ export class OrderbookService implements OnModuleInit {
       createdAt: order.createdAt.toString(),
     });
     pipeline.sadd(this.userOrdersKey(order.userId), order.id);
-
     await pipeline.exec();
   }
 
@@ -89,10 +87,7 @@ export class OrderbookService implements OnModuleInit {
     filledQuantity: string,
     status: Order['status'],
   ): Promise<void> {
-    await this.redis.hset(this.orderKey(orderId), {
-      filledQuantity,
-      status,
-    });
+    await this.redis.hset(this.orderKey(orderId), { filledQuantity, status });
   }
 
   // ─── Read operations ────────────────────────────────────────────────────────
@@ -105,19 +100,21 @@ export class OrderbookService implements OnModuleInit {
 
   async getBestBid(): Promise<string | null> {
     // Highest score = highest price = best bid
-    const result = await this.redis.zrevrange(this.bidsKey(), 0, 0, 'WITHSCORES');
-    return result.length >= 2 ? result[1] : null;
+    const [topId] = await this.redis.zrevrange(this.bidsKey(), 0, 0);
+    if (!topId) return null;
+    return this.redis.hget(this.orderKey(topId), 'price');
   }
 
   async getBestAsk(): Promise<string | null> {
     // Lowest score = lowest price = best ask
-    const result = await this.redis.zrange(this.asksKey(), 0, 0, 'WITHSCORES');
-    return result.length >= 2 ? result[1] : null;
+    const [topId] = await this.redis.zrange(this.asksKey(), '0', '0');
+    if (!topId) return null;
+    return this.redis.hget(this.orderKey(topId), 'price');
   }
 
   /**
-   * Returns all resting bids priced >= minPrice, sorted best-price-first,
-   * then by createdAt ascending (time priority). Used by the matching engine.
+   * Returns resting bids priced >= minPrice, best-price-first then time-priority.
+   * Used by the matching engine.
    */
   async getMatchingBids(minPrice: string): Promise<Order[]> {
     const min = new Decimal(minPrice).toFixed(8);
@@ -126,8 +123,8 @@ export class OrderbookService implements OnModuleInit {
   }
 
   /**
-   * Returns all resting asks priced <= maxPrice, sorted best-price-first,
-   * then by createdAt ascending (time priority). Used by the matching engine.
+   * Returns resting asks priced <= maxPrice, best-price-first then time-priority.
+   * Used by the matching engine.
    */
   async getMatchingAsks(maxPrice: string): Promise<Order[]> {
     const max = new Decimal(maxPrice).toFixed(8);
@@ -137,18 +134,16 @@ export class OrderbookService implements OnModuleInit {
 
   async getSnapshot(depth?: number): Promise<OrderbookSnapshot> {
     const d = depth ?? this.config.get<number>('app.trading.orderbookDepth')!;
+    const fetchLimit = d * 4; // overfetch to handle partially-filled orders
 
-    // Fetch more than needed to account for zero-remaining orders
-    const fetchLimit = d * 4;
-
-    const [rawBids, rawAsks] = await Promise.all([
-      this.redis.zrevrange(this.bidsKey(), 0, fetchLimit - 1, 'WITHSCORES'),
-      this.redis.zrange(this.asksKey(), 0, fetchLimit - 1, 'WITHSCORES'),
+    const [bidIds, askIds] = await Promise.all([
+      this.redis.zrevrange(this.bidsKey(), 0, fetchLimit - 1),
+      this.redis.zrange(this.asksKey(), '0', String(fetchLimit - 1)),
     ]);
 
     const [bids, asks] = await Promise.all([
-      this.aggregateLevels(rawBids, d),
-      this.aggregateLevels(rawAsks, d),
+      this.aggregateLevels(bidIds, d),
+      this.aggregateLevels(askIds, d),
     ]);
 
     return { pair: this.pair, bids, asks, timestamp: Date.now() };
@@ -176,43 +171,36 @@ export class OrderbookService implements OnModuleInit {
       orders.push(this.deserializeOrder(raw));
     }
 
-    // Time priority: earlier createdAt first (within same price the matching
-    // engine relies on this ordering)
+    // Time priority within same price level
     return orders.sort((a, b) => a.createdAt - b.createdAt);
   }
 
   private async aggregateLevels(
-    raw: string[],
+    ids: string[],
     depth: number,
   ): Promise<OrderbookLevel[]> {
-    // raw = [orderId, priceScore, orderId, priceScore, ...]
-    if (!raw.length) return [];
+    if (!ids.length) return [];
 
-    const pairs: { id: string; price: string }[] = [];
-    for (let i = 0; i < raw.length; i += 2) {
-      pairs.push({
-        id: raw[i],
-        price: new Decimal(raw[i + 1]).toFixed(8),
-      });
-    }
-
-    // Pipeline fetch remaining quantities for each order
+    // Pipeline: fetch price, quantity, filledQuantity for each order
     const pipeline = this.redis.pipeline();
-    for (const { id } of pairs) {
-      pipeline.hmget(this.orderKey(id), 'quantity', 'filledQuantity');
+    for (const id of ids) {
+      pipeline.hmget(this.orderKey(id), 'price', 'quantity', 'filledQuantity');
     }
     const results = await pipeline.exec();
 
-    // Aggregate remaining qty by price level — Map preserves insertion order
-    // which matches the Redis sort order (best price first)
+    // Aggregate remaining qty by price level. Map preserves insertion order
+    // which already matches Redis sort order (best price first).
     const levelMap = new Map<string, Decimal>();
 
-    for (let i = 0; i < pairs.length; i++) {
-      const { price } = pairs[i];
-      const [err, fields] = results![i] as [Error | null, [string | null, string | null]];
-      if (err || !fields[0]) continue;
+    for (const result of results ?? []) {
+      const [err, fields] = result as [
+        Error | null,
+        [string | null, string | null, string | null],
+      ];
+      if (err || !fields[0] || !fields[1]) continue;
 
-      const remaining = new Decimal(fields[0]).minus(fields[1] ?? '0');
+      const price = new Decimal(fields[0]).toFixed(8);
+      const remaining = new Decimal(fields[1]).minus(fields[2] ?? '0');
       if (remaining.lte(0)) continue;
 
       const current = levelMap.get(price) ?? new Decimal(0);
