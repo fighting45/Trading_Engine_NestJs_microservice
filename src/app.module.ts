@@ -5,6 +5,7 @@ import { LaravelModule } from './laravel/laravel.module.js';
 import { OrderbookModule } from './orderbook/orderbook.module.js';
 import { MatchingModule } from './matching/matching.module.js';
 import { OrdersModule } from './orders/orders.module.js';
+import { WebsocketModule } from './websocket/websocket.module.js';
 
 @Module({
   imports: [
@@ -14,7 +15,7 @@ import { OrdersModule } from './orders/orders.module.js';
     OrderbookModule,
     MatchingModule,
     OrdersModule,
-    // WebsocketModule — next
+    WebsocketModule,
   ],
 })
 export class AppModule {}
